@@ -13,6 +13,17 @@ function createBlob(data: Float32Array): Blob {
   };
 }
 
+function downsample(buffer: Float32Array, inputRate: number, outputRate: number): Float32Array {
+    if (inputRate === outputRate) return buffer;
+    const ratio = inputRate / outputRate;
+    const newLength = Math.round(buffer.length / ratio);
+    const result = new Float32Array(newLength);
+    for (let i = 0; i < newLength; i++) {
+        result[i] = buffer[Math.floor(i * ratio)];
+    }
+    return result;
+}
+
 function encode(bytes: Uint8Array) {
   let binary = '';
   const len = bytes.byteLength;
@@ -70,14 +81,18 @@ export class LiveClient {
     this.ai = new GoogleGenAI({ apiKey });
   }
 
-  async connect() {
+  async connect(audioDeviceId?: string) {
     if (this.isConnected) return;
 
-    this.inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-    this.outputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+    // Use default sample rate to avoid "NotSupportedError" on some browsers/devices
+    this.inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+    this.outputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
     
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const constraints: MediaStreamConstraints = {
+        audio: audioDeviceId ? { deviceId: { exact: audioDeviceId } } : true
+      };
+      this.stream = await navigator.mediaDevices.getUserMedia(constraints);
     } catch (e) {
       console.error("Microphone access denied", e);
       return;
@@ -113,7 +128,10 @@ export class LiveClient {
 
     this.processor.onaudioprocess = (e) => {
       const inputData = e.inputBuffer.getChannelData(0);
-      const blob = createBlob(inputData);
+      // Downsample system audio (usually 44.1k or 48k) to 16k expected by Gemini
+      const downsampledData = downsample(inputData, this.inputAudioContext!.sampleRate, 16000);
+      const blob = createBlob(downsampledData);
+      
       this.sessionPromise?.then(session => {
         session.sendRealtimeInput({ media: blob });
       });
@@ -130,6 +148,8 @@ export class LiveClient {
       
       this.nextStartTime = Math.max(this.nextStartTime, this.outputAudioContext.currentTime);
       
+      // Decode the 24kHz response. 
+      // The AudioContext can be 48kHz; createBuffer handles the specific sample rate of the source material.
       const audioBuffer = await decodeAudioData(
         decode(audioString),
         this.outputAudioContext,
@@ -164,7 +184,6 @@ export class LiveClient {
     this.outputAudioContext?.close();
     // Cannot explicitly close session object as it's not exposed directly from connect return, 
     // but closing websocket from server side or navigating away handles it.
-    // A robust impl would manage the session object returned by the promise more strictly.
     this.sessionPromise?.then(s => s.close());
   }
 }
