@@ -1,0 +1,8 @@
+{
+  "name": "Copy of GigaConference AI",
+  "description": "Платформа видеоконференций нового поколения с поддержкой до 60 участников, демонстрацией экрана и встроенным ИИ-ассистентом Gemini.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
