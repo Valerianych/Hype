@@ -79,7 +79,6 @@ export class LiveClient {
   constructor() {
     const apiKey = process.env.API_KEY;
     if (!apiKey) {
-        // Do not throw here to allow app to load, but log warning
         console.warn("API_KEY not found");
     }
     this.ai = new GoogleGenAI({ apiKey: apiKey || "dummy_key" });
@@ -88,11 +87,9 @@ export class LiveClient {
   async connect(audioDeviceId?: string) {
     if (this.isConnected) return;
 
-    // Use default sample rate to avoid "NotSupportedError" on some browsers/devices
     this.inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
     this.outputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
     
-    // Resume context immediately (fix for Chrome autoplay policy)
     await this.inputAudioContext.resume();
     await this.outputAudioContext.resume();
 
@@ -148,17 +145,22 @@ export class LiveClient {
       if (!this.isConnected) return;
 
       const inputData = e.inputBuffer.getChannelData(0);
-      // Downsample system audio (usually 44.1k or 48k) to 16k expected by Gemini
       const downsampledData = downsample(inputData, this.inputAudioContext!.sampleRate, 16000);
       
-      // Simple silence detection or guard could go here, but SDK handles silence reasonably well.
-      // Ensure we don't send empty data
       if (downsampledData.length > 0) {
           const blob = createBlob(downsampledData);
           this.sessionPromise?.then(session => {
+            // Guard against race conditions where disconnect happens during promise resolution
             if (this.isConnected) {
-                session.sendRealtimeInput({ media: blob });
+                try {
+                    session.sendRealtimeInput({ media: blob });
+                } catch (error) {
+                    // Ignore errors if the session is in the process of closing
+                    // This suppresses "Thread was cancelled" errors
+                }
             }
+          }).catch(() => {
+              // Ignore errors if session promise rejected
           });
       }
     };
@@ -209,7 +211,6 @@ export class LiveClient {
     this.source?.disconnect();
     this.stream?.getTracks().forEach(t => t.stop());
     
-    // Close contexts safely
     this.inputAudioContext?.close().catch(() => {});
     this.outputAudioContext?.close().catch(() => {});
     
