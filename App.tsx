@@ -1,5 +1,6 @@
+
 import React, { useState, useEffect, useRef } from 'react';
-import { MOCK_PARTICIPANTS, AI_PARTICIPANT } from './constants';
+import { AI_PARTICIPANT } from './constants';
 import { Participant, ViewMode } from './types';
 import { VideoTile } from './components/VideoTile';
 import { 
@@ -10,6 +11,28 @@ import {
   XIcon, ChevronDownIcon
 } from './components/Icons';
 import { LiveClient } from './services/liveClient';
+import { db, auth } from './services/firebase';
+import { ref, set, onValue, update, remove, onDisconnect, push, child, get } from 'firebase/database';
+import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+
+// Helper to update URL safely without throwing SecurityError in sandboxed iframes
+const safeUpdateUrl = (meetingId: string | null) => {
+    try {
+        const url = new URL(window.location.href);
+        if (meetingId) {
+            url.searchParams.set('meetingId', meetingId);
+        } else {
+            url.searchParams.delete('meetingId');
+        }
+        // Check if history API is available and not restricted
+        if (window.history && typeof window.history.replaceState === 'function') {
+            window.history.replaceState({}, '', url.toString());
+        }
+    } catch (e) {
+        // Silently ignore security errors common in CodeSandbox/StackBlitz/Iframes
+        // console.debug("URL update skipped due to environment restrictions");
+    }
+};
 
 export default function App() {
   // --- State ---
@@ -39,15 +62,38 @@ export default function App() {
   
   // UI
   const [showSidebar, setShowSidebar] = useState<'chat' | 'participants' | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [dbError, setDbError] = useState<string | null>(null);
   
   // --- Refs & Services ---
   const liveClient = useRef<LiveClient | null>(null);
-  const channelRef = useRef<BroadcastChannel | null>(null);
+  // Unique ID for this browser session to track "self" in the database
+  const mySessionId = useRef<string>(Math.random().toString(36).substring(2, 15));
 
   // --- Effects ---
   
   useEffect(() => {
-    // Check URL for meeting ID on load
+    // 1. Authenticate Anonymously to satisfy Firebase Rules (auth != null)
+    const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
+      if (user) {
+        setIsAuthReady(true);
+        console.log("Authenticated as:", user.uid);
+      } else {
+        signInAnonymously(auth).catch((error) => {
+           // If auth is disabled in console, we proceed assuming DB rules are public (.read: true, .write: true)
+           if (error.code === 'auth/admin-restricted-operation' || error.code === 'auth/operation-not-allowed') {
+               console.warn("Anonymous Auth disabled. Proceeding in unauthenticated mode. Ensure DB rules are public.");
+               setIsAuthReady(true);
+           } else {
+               console.error("Firebase Auth Error: " + error.message);
+               // Try to proceed anyway
+               setIsAuthReady(true);
+           }
+        });
+      }
+    });
+
+    // 2. Check URL for meeting ID on load
     try {
       const url = new URL(window.location.href);
       const existingMid = url.searchParams.get('meetingId');
@@ -66,77 +112,81 @@ export default function App() {
       setStep('landing');
     }
 
-    // Initialize Live Client
+    // 3. Initialize Live Client
     try {
       liveClient.current = new LiveClient();
       liveClient.current.onSpeakingStateChange = (speaking) => {
-        setParticipants(prev => prev.map(p => 
-          p.id === 'gemini-ai' ? { ...p, isSpeaking: speaking } : p
-        ));
+        // Update AI state in Firebase if I am the host (to avoid conflicts)
+        if (localRole === 'host' && meetingId) {
+           const aiRef = ref(db, `meetings/${meetingId}/participants/gemini-ai`);
+           update(aiRef, { isSpeaking: speaking }).catch(console.error);
+        }
       };
     } catch (e) {
       console.error("Failed to initialize LiveClient:", e);
     }
 
-    // Setup BroadcastChannel for tab sync
-    const channel = new BroadcastChannel('giga-conference-sync');
-    channelRef.current = channel;
-
-    channel.onmessage = (event) => {
-      const { type, payload } = event.data;
-      
-      if (type === 'NEW_PARTICIPANT') {
-         setParticipants(prev => {
-             if (prev.some(p => p.id === payload.id)) return prev;
-             return [...prev, payload];
-         });
-         // Announce ourselves to the new guy
-         if (step === 'meeting') {
-             const local = participants.find(p => p.id === 'local');
-             if (local) channel.postMessage({ type: 'EXISTING_PARTICIPANT', payload: local });
-         }
-      } else if (type === 'EXISTING_PARTICIPANT') {
-         setParticipants(prev => {
-             if (prev.some(p => p.id === payload.id)) return prev;
-             return [...prev, payload];
-         });
-      } else if (type === 'UPDATE_PARTICIPANT') {
-         setParticipants(prev => prev.map(p => p.id === payload.id ? payload : p));
-      } else if (type === 'REMOVE_PARTICIPANT') {
-         setParticipants(prev => prev.filter(p => p.id !== payload.id));
-      } else if (type === 'HOST_ACTION_MUTE_ALL') {
-         const local = participants.find(p => p.id === 'local');
-         if (local && local.role !== 'host') {
-             setIsMuted(true);
-             if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = false);
-             setParticipants(prev => prev.map(p => p.id === 'local' ? { ...p, isMuted: true } : p));
-         }
-      } else if (type === 'HOST_ACTION_KICK') {
-         if (payload.id === 'local') {
-             alert("Вы были удалены организатором.");
-             leaveMeeting();
-         } else {
-             setParticipants(prev => prev.filter(p => p.id !== payload.id));
-         }
-      }
-    };
-
     return () => {
+      unsubscribeAuth();
       if (liveClient.current) liveClient.current.disconnect();
       if (localStream) localStream.getTracks().forEach(t => t.stop());
       if (screenStream) screenStream.getTracks().forEach(t => t.stop());
-      channel.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Sync local changes to other tabs
+  // --- Firebase Synchronization ---
   useEffect(() => {
-    const local = participants.find(p => p.id === 'local');
-    if (local && channelRef.current) {
-        channelRef.current.postMessage({ type: 'UPDATE_PARTICIPANT', payload: local });
-    }
-  }, [participants]);
+    if (step !== 'meeting' || !meetingId || !isAuthReady) return;
+
+    const meetingRef = ref(db, `meetings/${meetingId}/participants`);
+    
+    // Subscribe to participant changes
+    const unsubscribe = onValue(meetingRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data) {
+        const participantList: Participant[] = Object.values(data);
+        
+        // If I was kicked (my ID is no longer in the list), leave
+        const amIStillHere = participantList.some(p => p.id === mySessionId.current);
+        if (!amIStillHere) {
+             alert("Вы были удалены организатором или встреча завершилась.");
+             leaveMeeting();
+             return;
+        }
+
+        // Update screen share active ID
+        const sharer = participantList.find(p => p.isScreenSharing);
+        if (sharer && !activeScreenId) {
+             // Auto switch logic could go here
+        } else if (!sharer && activeScreenId) {
+             setActiveScreenId(null);
+             setViewMode(ViewMode.GALLERY);
+        }
+
+        // Check if I was muted by host
+        const myData = participantList.find(p => p.id === mySessionId.current);
+        if (myData && myData.isMuted && !isMuted) {
+             setIsMuted(true);
+             if(localStream) localStream.getAudioTracks().forEach(t => t.enabled = false);
+        }
+
+        setParticipants(participantList);
+      } else {
+        // Meeting deleted or empty
+        setParticipants([]);
+      }
+    }, (error) => {
+        if (error.message.includes("PERMISSION_DENIED")) {
+            setDbError("PERMISSION_DENIED");
+        } else {
+            console.error("Firebase Read Error:", error);
+        }
+    });
+
+    return () => unsubscribe();
+  }, [step, meetingId, isAuthReady]);
+
 
   // --- Actions ---
 
@@ -144,16 +194,7 @@ export default function App() {
     const newId = Math.random().toString(36).substring(7);
     setMeetingId(newId);
     setLocalRole('host'); // Creator is HOST
-    
-    // Update URL immediately
-    try {
-      const newUrl = new URL(window.location.href);
-      newUrl.searchParams.set('meetingId', newId);
-      window.history.replaceState({}, '', newUrl.toString());
-    } catch (e) {
-      console.warn("Could not update URL", e);
-    }
-    
+    safeUpdateUrl(newId);
     setStep('name');
   };
 
@@ -161,15 +202,7 @@ export default function App() {
     if (!inputMeetingId.trim()) return alert("Введите ID встречи");
     setMeetingId(inputMeetingId);
     setLocalRole('guest'); // Joiner via code is GUEST
-    
-    try {
-      const newUrl = new URL(window.location.href);
-      newUrl.searchParams.set('meetingId', inputMeetingId);
-      window.history.replaceState({}, '', newUrl.toString());
-    } catch (e) {
-      console.warn("Could not update URL", e);
-    }
-
+    safeUpdateUrl(inputMeetingId);
     setStep('name');
   };
 
@@ -242,9 +275,14 @@ export default function App() {
   // --- Meeting Handlers ---
 
   const startMeeting = async () => {
-    // Use the role determined at entry (Host if Created, Guest if Joined)
+    if (!isAuthReady) {
+        alert("Ожидание подключения к серверу...");
+        return;
+    }
+
+    // 1. Construct Local User Object
     const localUser: Participant = {
-      id: 'local',
+      id: mySessionId.current,
       name: userName,
       avatarUrl: '',
       isMuted: isMuted,
@@ -252,13 +290,35 @@ export default function App() {
       isSpeaking: false,
       role: localRole, 
     };
+
+    // 2. Write to Firebase
+    const userRef = ref(db, `meetings/${meetingId}/participants/${mySessionId.current}`);
     
-    setParticipants([AI_PARTICIPANT, localUser]); 
+    try {
+        await set(userRef, localUser);
+    } catch (e: any) {
+        if (e.code === 'PERMISSION_DENIED') {
+             setDbError("PERMISSION_DENIED");
+        } else {
+             alert("Ошибка подключения к базе данных: " + e.message);
+        }
+        return;
+    }
     
-    // Broadcast join
-    channelRef.current?.postMessage({ type: 'NEW_PARTICIPANT', payload: { ...localUser, id: `user-${Math.random().toString(36).substr(2,9)}` } }); 
+    // 3. Set Disconnect Handler (Remove user if tab closes)
+    onDisconnect(userRef).remove().catch(err => console.warn("onDisconnect failed (likely permissions):", err));
+
+    // 4. If Host, also ensure AI participant exists
+    if (localRole === 'host') {
+        const aiRef = ref(db, `meetings/${meetingId}/participants/gemini-ai`);
+        get(aiRef).then((snapshot) => {
+            if (!snapshot.exists()) {
+                set(aiRef, AI_PARTICIPANT).catch(console.error);
+            }
+        }).catch(console.error);
+    }
     
-    // Get stream with selected devices if not already active or correct
+    // 5. Get stream with selected devices if not already active or correct
     if (!localStream || localStream.getAudioTracks()[0]?.getSettings().deviceId !== selectedAudioId) {
          try {
             const constraints = {
@@ -279,15 +339,17 @@ export default function App() {
   };
 
   const leaveMeeting = () => {
-    // Reset to Landing, clear ID
+    // Remove from Firebase
+    if (meetingId && mySessionId.current && isAuthReady) {
+        const userRef = ref(db, `meetings/${meetingId}/participants/${mySessionId.current}`);
+        remove(userRef).catch(console.error);
+    }
+
+    // Reset State
     setStep('landing');
     setMeetingId('');
     setLocalRole('guest');
-    
-    const local = participants.find(p => p.id === 'local');
-    if (local && channelRef.current) {
-         channelRef.current.postMessage({ type: 'REMOVE_PARTICIPANT', payload: { id: 'local' } });
-    }
+    setParticipants([]);
 
     if (localStream) localStream.getTracks().forEach(t => t.stop());
     if (screenStream) screenStream.getTracks().forEach(t => t.stop());
@@ -297,28 +359,32 @@ export default function App() {
     setActiveScreenId(null);
     if (liveClient.current) liveClient.current.disconnect();
 
-    // Clean URL
-    try {
-        const newUrl = new URL(window.location.href);
-        newUrl.searchParams.delete('meetingId');
-        window.history.replaceState({}, '', newUrl.toString());
-    } catch (e) {}
+    safeUpdateUrl(null);
+  };
+
+  // --- Control Handlers (Sync to Firebase) ---
+
+  const updateMyStatus = (updates: Partial<Participant>) => {
+      const userRef = ref(db, `meetings/${meetingId}/participants/${mySessionId.current}`);
+      update(userRef, updates).catch(console.error);
   };
 
   const toggleMute = () => {
     if (localStream) {
       localStream.getAudioTracks().forEach(track => track.enabled = !isMuted);
     }
-    setIsMuted(!isMuted);
-    setParticipants(prev => prev.map(p => p.id === 'local' ? {...p, isMuted: !isMuted} : p));
+    const newMuted = !isMuted;
+    setIsMuted(newMuted);
+    updateMyStatus({ isMuted: newMuted });
   };
 
   const toggleVideo = () => {
     if (localStream) {
       localStream.getVideoTracks().forEach(track => track.enabled = !isVideoOff);
     }
-    setIsVideoOff(!isVideoOff);
-    setParticipants(prev => prev.map(p => p.id === 'local' ? {...p, isVideoOff: !isVideoOff} : p));
+    const newVideoOff = !isVideoOff;
+    setIsVideoOff(newVideoOff);
+    updateMyStatus({ isVideoOff: newVideoOff });
   };
 
   const toggleScreenShare = async () => {
@@ -327,25 +393,25 @@ export default function App() {
     if (isSharing) {
       screenStream?.getTracks().forEach(t => t.stop());
       setScreenStream(null);
-      if (activeScreenId === 'local') {
+      if (activeScreenId === mySessionId.current) {
         setActiveScreenId(null);
         setViewMode(ViewMode.GALLERY);
       }
-      setParticipants(prev => prev.map(p => p.id === 'local' ? {...p, isScreenSharing: false} : p));
+      updateMyStatus({ isScreenSharing: false });
       return;
     }
 
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
       setScreenStream(stream);
-      setActiveScreenId('local');
+      setActiveScreenId(mySessionId.current);
       setViewMode(ViewMode.SCREEN_SHARE);
-      setParticipants(prev => prev.map(p => p.id === 'local' ? {...p, isScreenSharing: true} : p));
+      updateMyStatus({ isScreenSharing: true });
       
       stream.getVideoTracks()[0].onended = () => {
         setScreenStream(null);
-        setActiveScreenId(prev => prev === 'local' ? null : prev);
-        setParticipants(prev => prev.map(p => p.id === 'local' ? {...p, isScreenSharing: false} : p));
+        setActiveScreenId(prev => prev === mySessionId.current ? null : prev);
+        updateMyStatus({ isScreenSharing: false });
       };
     } catch (err) {
       console.error("Screen share cancelled or failed", err);
@@ -356,7 +422,10 @@ export default function App() {
     const aiPart = participants.find(p => p.role === 'ai');
     if (aiPart?.isSpeaking) {
        liveClient.current?.disconnect();
-       setParticipants(prev => prev.map(p => p.role === 'ai' ? {...p, isSpeaking: false} : p));
+       if (localRole === 'host') {
+           const aiRef = ref(db, `meetings/${meetingId}/participants/gemini-ai`);
+           update(aiRef, { isSpeaking: false });
+       }
     } else {
        await liveClient.current?.connect(selectedAudioId);
     }
@@ -384,32 +453,36 @@ export default function App() {
   // --- Host Controls ---
 
   const muteAll = () => {
-    setParticipants(prev => prev.map(p => {
-      if (p.role === 'host' || p.role === 'ai') return p;
-      return { ...p, isMuted: true };
-    }));
-    channelRef.current?.postMessage({ type: 'HOST_ACTION_MUTE_ALL', payload: {} });
+    participants.forEach(p => {
+        if (p.role !== 'host' && p.role !== 'ai' && !p.isMuted) {
+             const pRef = ref(db, `meetings/${meetingId}/participants/${p.id}`);
+             update(pRef, { isMuted: true });
+        }
+    });
   };
 
   const muteParticipant = (id: string) => {
-    setParticipants(prev => prev.map(p => p.id === id ? { ...p, isMuted: !p.isMuted } : p));
+    const p = participants.find(p => p.id === id);
+    if (p) {
+        const pRef = ref(db, `meetings/${meetingId}/participants/${id}`);
+        update(pRef, { isMuted: !p.isMuted });
+    }
   };
 
   const kickParticipant = (id: string) => {
     if(confirm("Вы уверены, что хотите удалить этого участника?")) {
-      setParticipants(prev => prev.filter(p => p.id !== id));
-      channelRef.current?.postMessage({ type: 'HOST_ACTION_KICK', payload: { id } });
+       const pRef = ref(db, `meetings/${meetingId}/participants/${id}`);
+       remove(pRef);
     }
   };
 
   const toggleParticipantRole = (id: string) => {
-    setParticipants(prev => prev.map(p => {
-      if (p.id === id) {
+     const p = participants.find(p => p.id === id);
+     if (p) {
          const newRole = p.role === 'host' ? 'guest' : 'host';
-         return { ...p, role: newRole };
-      }
-      return p;
-    }));
+         const pRef = ref(db, `meetings/${meetingId}/participants/${id}`);
+         update(pRef, { role: newRole });
+     }
   };
 
   const focusScreen = (participantId: string) => {
@@ -418,6 +491,37 @@ export default function App() {
   };
 
   // --- Render Layouts ---
+
+  const renderDbError = () => (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4">
+        <div className="bg-gray-800 p-6 rounded-xl max-w-lg w-full border border-red-500/50">
+            <h2 className="text-xl font-bold text-red-400 mb-4">Ошибка доступа к базе данных</h2>
+            <p className="mb-4 text-gray-300">
+                Firebase заблокировал запись данных. Это происходит, когда не настроены правила безопасности или отключена анонимная аутентификация.
+            </p>
+            <div className="bg-black/50 p-4 rounded-lg mb-4 font-mono text-xs text-green-400 overflow-x-auto">
+                <pre className="whitespace-pre-wrap">
+{`// Firebase Console -> Realtime Database -> Rules
+{
+  "rules": {
+    ".read": true,
+    ".write": true
+  }
+}`}
+                </pre>
+            </div>
+            <p className="text-sm text-gray-500 mb-6">
+                Скопируйте эти правила в консоль Firebase, чтобы разрешить доступ.
+            </p>
+            <button 
+                onClick={() => setDbError(null)}
+                className="w-full py-3 bg-gray-700 hover:bg-gray-600 rounded-lg text-white"
+            >
+                Понятно
+            </button>
+        </div>
+    </div>
+  );
 
   const renderLanding = () => (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-900 via-black to-gray-900 text-white p-4 relative overflow-hidden">
@@ -443,10 +547,17 @@ export default function App() {
             <div className="space-y-4">
                 <button 
                     onClick={createNewMeeting}
-                    className="w-full py-4 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-lg shadow-lg shadow-blue-600/25 transition-all transform hover:-translate-y-1 flex items-center justify-center gap-3"
+                    disabled={!isAuthReady}
+                    className={`w-full py-4 rounded-xl font-bold text-lg shadow-lg transition-all flex items-center justify-center gap-3 ${isAuthReady ? 'bg-blue-600 hover:bg-blue-500 shadow-blue-600/25 transform hover:-translate-y-1' : 'bg-gray-700 cursor-not-allowed opacity-50'}`}
                 >
-                    <VideoIcon className="w-6 h-6" />
-                    Создать новую встречу
+                    {isAuthReady ? (
+                        <>
+                            <VideoIcon className="w-6 h-6" />
+                            Создать новую встречу
+                        </>
+                    ) : (
+                        <span>Подключение...</span>
+                    )}
                 </button>
                 
                 <div className="relative">
@@ -468,6 +579,7 @@ export default function App() {
                     />
                     <button 
                         onClick={joinWithCode}
+                        disabled={!isAuthReady}
                         className="px-6 py-3 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-xl font-semibold transition-colors"
                     >
                         Войти
@@ -478,6 +590,7 @@ export default function App() {
     </div>
   );
 
+  // ... (renderJoinScreen, renderLobby, renderGrid, renderSidebar kept exactly as before)
   const renderJoinScreen = () => (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gray-900 text-white p-4">
        <div className="bg-gray-800 p-8 rounded-2xl shadow-2xl max-w-md w-full border border-gray-700 relative overflow-hidden">
@@ -517,7 +630,7 @@ export default function App() {
               {localRole === 'host' ? 'Настроить оборудование' : 'Продолжить'}
             </button>
             <button 
-                onClick={() => setStep('landing')}
+                onClick={() => { setStep('landing'); safeUpdateUrl(null); }}
                 className="w-full text-sm text-gray-500 hover:text-gray-300 mt-2"
             >
                 Назад
@@ -526,8 +639,6 @@ export default function App() {
        </div>
     </div>
   );
-
-  // ... (Existing Render Methods: renderDeviceSelectors, renderLobby, etc. - kept same logic, just referencing new state)
 
   const renderDeviceSelectors = () => (
       <div className="grid grid-cols-1 gap-4 text-left">
@@ -696,7 +807,7 @@ export default function App() {
                <div className="w-8 h-5 rounded bg-gray-600 flex items-center justify-center">
                   <MonitorUpIcon className="w-3 h-3 text-white" />
                </div>
-               <span className="text-xs truncate max-w-full">{p.id === 'local' ? 'Ваш экран' : p.name}</span>
+               <span className="text-xs truncate max-w-full">{p.id === mySessionId.current ? 'Ваш экран' : p.name}</span>
             </button>
           ))}
           <button 
@@ -719,7 +830,7 @@ export default function App() {
            
            <div className="flex-1 flex p-4 gap-4 overflow-hidden">
               <div className="flex-1 bg-black rounded-2xl overflow-hidden relative border border-gray-800 flex items-center justify-center">
-                 {activeScreenId === 'local' && screenStream ? (
+                 {activeScreenId === mySessionId.current && screenStream ? (
                     <video 
                       ref={ref => ref && (ref.srcObject = screenStream)} 
                       autoPlay 
@@ -727,15 +838,18 @@ export default function App() {
                       className="w-full h-full object-contain"
                     />
                  ) : (
-                    <div className="flex flex-col items-center text-gray-500">
+                    <div className="flex flex-col items-center text-gray-500 p-8 text-center">
                        <MonitorUpIcon className="w-24 h-24 mb-4 opacity-20 animate-pulse" />
                        <p className="text-xl font-semibold">Демонстрация экрана: {sharer?.name}</p>
-                       <p className="text-sm">(Симуляция контента)</p>
+                       <p className="text-sm mt-2 max-w-md text-gray-600">
+                           В настоящем приложении здесь был бы видеопоток через WebRTC. 
+                           Сейчас мы синхронизируем только статус демонстрации через Firebase.
+                       </p>
                     </div>
                  )}
                  
                  <div className="absolute top-4 left-4 bg-blue-600/90 px-3 py-1 rounded text-sm font-bold backdrop-blur-md shadow-lg">
-                   {activeScreenId === 'local' ? 'Вы демонстрируете экран' : `Экран: ${sharer?.name}`}
+                   {activeScreenId === mySessionId.current ? 'Вы демонстрируете экран' : `Экран: ${sharer?.name}`}
                  </div>
               </div>
               
@@ -744,8 +858,8 @@ export default function App() {
                     <div key={p.id} className="h-32 shrink-0">
                       <VideoTile 
                         participant={p} 
-                        isLocal={p.id === 'local'} 
-                        stream={p.id === 'local' ? localStream : undefined} 
+                        isLocal={p.id === mySessionId.current} 
+                        stream={p.id === mySessionId.current ? localStream : undefined} 
                       />
                     </div>
                  ))}
@@ -778,8 +892,8 @@ export default function App() {
                <div key={p.id} className="aspect-video">
                   <VideoTile 
                     participant={p} 
-                    isLocal={p.id === 'local'}
-                    stream={p.id === 'local' ? localStream : undefined}
+                    isLocal={p.id === mySessionId.current}
+                    stream={p.id === mySessionId.current ? localStream : undefined}
                   />
                </div>
              ))}
@@ -790,7 +904,7 @@ export default function App() {
   };
 
   const renderSidebar = () => {
-     const localParticipant = participants.find(p => p.id === 'local');
+     const localParticipant = participants.find(p => p.id === mySessionId.current);
      const isLocalHost = localParticipant?.role === 'host';
 
      return (
@@ -834,10 +948,12 @@ export default function App() {
                       <div className="flex items-center gap-3 overflow-hidden">
                         {p.role === 'ai' ? (
                             <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-xs">AI</div>
-                        ) : p.id === 'local' ? (
+                        ) : p.id === mySessionId.current ? (
                             <div className="w-8 h-8 bg-gray-600 rounded-full flex items-center justify-center text-xs font-bold">Вы</div>
                         ) : (
-                            <img src={p.avatarUrl} className="w-8 h-8 rounded-full" alt="" />
+                            <div className="w-8 h-8 bg-gray-600 rounded-full flex items-center justify-center text-xs font-bold">
+                                {p.name.charAt(0)}
+                            </div>
                         )}
                         <div className="flex flex-col truncate">
                             <span className="text-sm truncate font-medium flex items-center gap-1">
@@ -849,7 +965,7 @@ export default function App() {
                       </div>
 
                       <div className="flex items-center gap-1">
-                         {p.role !== 'ai' && p.id !== 'local' && isLocalHost && (
+                         {p.role !== 'ai' && p.id !== mySessionId.current && isLocalHost && (
                              <>
                                 <button 
                                     onClick={() => toggleParticipantRole(p.id)}
@@ -898,13 +1014,14 @@ export default function App() {
     );
   };
 
-  if (step === 'landing') return renderLanding();
-  if (step === 'name') return renderJoinScreen();
-  if (step === 'lobby') return renderLobby();
+  if (step === 'landing') return <>{dbError && renderDbError()}{renderLanding()}</>;
+  if (step === 'name') return <>{dbError && renderDbError()}{renderJoinScreen()}</>;
+  if (step === 'lobby') return <>{dbError && renderDbError()}{renderLobby()}</>;
 
   return (
     <div className="flex flex-col h-screen bg-gray-900 text-white">
       
+      {dbError && renderDbError()}
       {showSettings && renderSettingsModal()}
 
       {/* Main Content Area */}
