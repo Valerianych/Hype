@@ -65,6 +65,10 @@ export default function App() {
   const [isAuthReady, setIsAuthReady] = useState(false);
   const [dbError, setDbError] = useState<string | null>(null);
   
+  // AI State
+  const [isAiConnected, setIsAiConnected] = useState(false);
+  const [isAiSupported, setIsAiSupported] = useState(true);
+  
   // --- Refs & Services ---
   const liveClient = useRef<LiveClient | null>(null);
   // Unique ID for this browser session to track "self" in the database
@@ -115,6 +119,19 @@ export default function App() {
     // 3. Initialize Live Client
     try {
       liveClient.current = new LiveClient();
+      
+      // Sync connection state
+      liveClient.current.onConnectionStateChange = (connected) => {
+        setIsAiConnected(connected);
+        if (!connected && localRole === 'host') {
+            // If disconnected, ensure database reflects this
+            if (meetingId) {
+               const aiRef = ref(db, `meetings/${meetingId}/participants/gemini-ai`);
+               update(aiRef, { isSpeaking: false }).catch(() => {});
+            }
+        }
+      };
+
       liveClient.current.onSpeakingStateChange = (speaking) => {
         // Update AI state in Firebase if I am the host (to avoid conflicts)
         if (localRole === 'host' && meetingId) {
@@ -122,8 +139,13 @@ export default function App() {
            update(aiRef, { isSpeaking: speaking }).catch(console.error);
         }
       };
+      
+      if (!process.env.API_KEY) {
+         setIsAiSupported(false);
+      }
     } catch (e) {
       console.error("Failed to initialize LiveClient:", e);
+      setIsAiSupported(false);
     }
 
     return () => {
@@ -419,13 +441,8 @@ export default function App() {
   };
 
   const toggleAiAssistant = async () => {
-    const aiPart = participants.find(p => p.role === 'ai');
-    if (aiPart?.isSpeaking) {
+    if (isAiConnected) {
        liveClient.current?.disconnect();
-       if (localRole === 'host') {
-           const aiRef = ref(db, `meetings/${meetingId}/participants/gemini-ai`);
-           update(aiRef, { isSpeaking: false });
-       }
     } else {
        await liveClient.current?.connect(selectedAudioId);
     }
@@ -1070,10 +1087,11 @@ export default function App() {
 
            <button 
              onClick={toggleAiAssistant}
-             className="px-6 py-3 rounded-full bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 flex items-center gap-2 transition-all hover:scale-105 shadow-lg"
+             disabled={!isAiSupported}
+             className={`px-6 py-3 rounded-full flex items-center gap-2 transition-all hover:scale-105 shadow-lg ${!isAiSupported ? 'bg-gray-700 opacity-50 cursor-not-allowed' : isAiConnected ? 'bg-red-500 hover:bg-red-600 animate-pulse' : 'bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500'}`}
            >
              <SparklesIcon className="w-5 h-5" />
-             <span className="font-semibold hidden md:inline">AI Ассистент</span>
+             <span className="font-semibold hidden md:inline">{isAiConnected ? 'Остановить AI' : 'AI Ассистент'}</span>
            </button>
 
            <div className="w-px h-8 bg-gray-700 mx-2"></div>

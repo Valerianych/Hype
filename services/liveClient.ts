@@ -74,11 +74,15 @@ export class LiveClient {
   private sessionPromise: Promise<any> | null = null;
   
   public onSpeakingStateChange: (isSpeaking: boolean) => void = () => {};
+  public onConnectionStateChange: (isConnected: boolean) => void = () => {};
 
   constructor() {
     const apiKey = process.env.API_KEY;
-    if (!apiKey) throw new Error("API_KEY not found");
-    this.ai = new GoogleGenAI({ apiKey });
+    if (!apiKey) {
+        // Do not throw here to allow app to load, but log warning
+        console.warn("API_KEY not found");
+    }
+    this.ai = new GoogleGenAI({ apiKey: apiKey || "dummy_key" });
   }
 
   async connect(audioDeviceId?: string) {
@@ -88,6 +92,10 @@ export class LiveClient {
     this.inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
     this.outputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
     
+    // Resume context immediately (fix for Chrome autoplay policy)
+    await this.inputAudioContext.resume();
+    await this.outputAudioContext.resume();
+
     try {
       const constraints: MediaStreamConstraints = {
         audio: audioDeviceId ? { deviceId: { exact: audioDeviceId } } : true
@@ -98,43 +106,61 @@ export class LiveClient {
       return;
     }
 
-    this.sessionPromise = this.ai.live.connect({
-      model: 'gemini-2.5-flash-native-audio-preview-09-2025',
-      config: {
-        responseModalities: [Modality.AUDIO],
-        systemInstruction: "You are a helpful video conference assistant named Gemini. You are participating in a large meeting. Be concise, professional, and helpful. Speak Russian.",
-        speechConfig: {
-            voiceConfig: {prebuiltVoiceConfig: {voiceName: 'Kore'}},
+    try {
+        this.sessionPromise = this.ai.live.connect({
+        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+        config: {
+            responseModalities: [Modality.AUDIO],
+            systemInstruction: "You are a helpful video conference assistant named Gemini. You are participating in a large meeting. Be concise, professional, and helpful. Speak Russian.",
+            speechConfig: {
+                voiceConfig: {prebuiltVoiceConfig: {voiceName: 'Kore'}},
+            },
         },
-      },
-      callbacks: {
-        onopen: this.onOpen.bind(this),
-        onmessage: this.onMessage.bind(this),
-        onclose: () => {
-            console.log("Live session closed");
-            this.isConnected = false;
-        },
-        onerror: (err) => console.error("Live session error", err),
-      }
-    });
+        callbacks: {
+            onopen: this.onOpen.bind(this),
+            onmessage: this.onMessage.bind(this),
+            onclose: () => {
+                console.log("Live session closed");
+                this.disconnect();
+            },
+            onerror: (err) => {
+                console.error("Live session error", err);
+                this.disconnect();
+            },
+        }
+        });
+    } catch (err) {
+        console.error("Failed to initiate Live Connect", err);
+        this.disconnect();
+    }
   }
 
   private onOpen() {
     this.isConnected = true;
+    this.onConnectionStateChange(true);
+
     if (!this.inputAudioContext || !this.stream) return;
 
     this.source = this.inputAudioContext.createMediaStreamSource(this.stream);
     this.processor = this.inputAudioContext.createScriptProcessor(4096, 1, 1);
 
     this.processor.onaudioprocess = (e) => {
+      if (!this.isConnected) return;
+
       const inputData = e.inputBuffer.getChannelData(0);
       // Downsample system audio (usually 44.1k or 48k) to 16k expected by Gemini
       const downsampledData = downsample(inputData, this.inputAudioContext!.sampleRate, 16000);
-      const blob = createBlob(downsampledData);
       
-      this.sessionPromise?.then(session => {
-        session.sendRealtimeInput({ media: blob });
-      });
+      // Simple silence detection or guard could go here, but SDK handles silence reasonably well.
+      // Ensure we don't send empty data
+      if (downsampledData.length > 0) {
+          const blob = createBlob(downsampledData);
+          this.sessionPromise?.then(session => {
+            if (this.isConnected) {
+                session.sendRealtimeInput({ media: blob });
+            }
+          });
+      }
     };
 
     this.source.connect(this.processor);
@@ -148,8 +174,6 @@ export class LiveClient {
       
       this.nextStartTime = Math.max(this.nextStartTime, this.outputAudioContext.currentTime);
       
-      // Decode the 24kHz response. 
-      // The AudioContext can be 48kHz; createBuffer handles the specific sample rate of the source material.
       const audioBuffer = await decodeAudioData(
         decode(audioString),
         this.outputAudioContext,
@@ -167,7 +191,6 @@ export class LiveClient {
       this.nextStartTime += audioBuffer.duration;
 
       source.onended = () => {
-          // Simple heuristic: if buffer ended and time is caught up, stop speaking animation
           if (this.outputAudioContext && this.outputAudioContext.currentTime >= this.nextStartTime) {
              this.onSpeakingStateChange(false);
           }
@@ -176,14 +199,33 @@ export class LiveClient {
   }
 
   disconnect() {
+    if (!this.isConnected && !this.sessionPromise) return;
+
     this.isConnected = false;
+    this.onConnectionStateChange(false);
+    this.onSpeakingStateChange(false);
+
     this.processor?.disconnect();
     this.source?.disconnect();
     this.stream?.getTracks().forEach(t => t.stop());
-    this.inputAudioContext?.close();
-    this.outputAudioContext?.close();
-    // Cannot explicitly close session object as it's not exposed directly from connect return, 
-    // but closing websocket from server side or navigating away handles it.
-    this.sessionPromise?.then(s => s.close());
+    
+    // Close contexts safely
+    this.inputAudioContext?.close().catch(() => {});
+    this.outputAudioContext?.close().catch(() => {});
+    
+    this.sessionPromise?.then(s => {
+        try {
+            s.close(); 
+        } catch(e) {
+            // Ignore close errors
+        }
+    });
+    
+    this.sessionPromise = null;
+    this.inputAudioContext = null;
+    this.outputAudioContext = null;
+    this.stream = null;
+    this.processor = null;
+    this.source = null;
   }
 }
