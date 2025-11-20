@@ -12,44 +12,62 @@ export const VideoTile: React.FC<VideoTileProps> = ({ participant, isLocal, stre
   const videoRef = React.useRef<HTMLVideoElement>(null);
 
   React.useEffect(() => {
-    if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream;
+    if (videoRef.current) {
+      videoRef.current.srcObject = stream ?? null;
     }
   }, [stream]);
 
-  return (
-    <div className={`relative w-full h-full bg-gray-800 rounded-lg overflow-hidden border ${participant.isSpeaking ? 'border-green-500 border-2' : 'border-gray-700'} group`}>
-      {/* Video Content */}
-      {participant.role === 'ai' ? (
+  const renderContent = () => {
+    if (participant.role === 'ai') {
+      return (
         <div className="w-full h-full flex items-center justify-center bg-indigo-900/30 relative">
-             <div className={`absolute inset-0 bg-gradient-to-t from-indigo-900/80 to-transparent opacity-50`} />
-             <div className={`w-24 h-24 rounded-full bg-gradient-to-r from-blue-400 to-purple-600 flex items-center justify-center shadow-[0_0_30px_rgba(79,70,229,0.5)] ${participant.isSpeaking ? 'animate-pulse scale-110 transition-transform' : ''}`}>
-                <span className="text-3xl">✨</span>
-             </div>
-        </div>
-      ) : !participant.isVideoOff || isLocal ? (
-        isLocal && stream ? (
-          <video 
-            ref={videoRef} 
-            autoPlay 
-            muted 
-            playsInline 
-            className="w-full h-full object-cover transform scale-x-[-1]" // Mirror local video
-          />
-        ) : (
-          <img 
-            src={participant.avatarUrl} 
-            alt={participant.name} 
-            className="w-full h-full object-cover"
-          />
-        )
-      ) : (
-        <div className="w-full h-full flex items-center justify-center bg-gray-700">
-          <div className="w-20 h-20 rounded-full bg-gray-600 flex items-center justify-center text-2xl font-semibold">
-            {participant.name.charAt(0)}
+          <div className="absolute inset-0 bg-gradient-to-t from-indigo-900/80 to-transparent opacity-50" />
+          <div
+            className={`w-24 h-24 rounded-full bg-gradient-to-r from-blue-400 to-purple-600 flex items-center justify-center shadow-[0_0_30px_rgba(79,70,229,0.5)] ${participant.isSpeaking ? 'animate-pulse scale-110 transition-transform' : ''}`}
+          >
+            <span className="text-3xl">✨</span>
           </div>
         </div>
-      )}
+      );
+    }
+
+    if (!participant.isVideoOff && stream) {
+      return (
+        <video
+          ref={videoRef}
+          autoPlay
+          muted={isLocal}
+          playsInline
+          className={`w-full h-full object-cover ${isLocal ? 'transform scale-x-[-1]' : ''}`}
+        />
+      );
+    }
+
+    if (participant.avatarUrl) {
+      return (
+        <img
+          src={participant.avatarUrl}
+          alt={participant.name}
+          className="w-full h-full object-cover"
+        />
+      );
+    }
+
+    return (
+      <div className="w-full h-full flex items-center justify-center bg-gray-700">
+        <div className="w-20 h-20 rounded-full bg-gray-600 flex items-center justify-center text-2xl font-semibold">
+          {participant.name.charAt(0)}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div
+      className={`relative w-full h-full bg-gray-800 rounded-lg overflow-hidden border ${participant.isSpeaking ? 'border-green-500 border-2' : 'border-gray-700'} group`}
+    >
+      {/* Video Content */}
+      {renderContent()}
 
       {/* Status Overlay */}
       <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-colors pointer-events-none" />
