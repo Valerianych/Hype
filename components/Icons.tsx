@@ -54,7 +54,7 @@ export const LayoutGridIcon = ({ className }: { className?: string }) => (
 );
 
 export const SparklesIcon = ({ className }: { className?: string }) => (
-    <IconWrapper className={className}><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/></IconWrapper>
+    <IconWrapper className={className}><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L12 3Z"/></IconWrapper>
 );
 
 export const LinkIcon = ({ className }: { className?: string }) => (
@@ -71,4 +71,8 @@ export const ShieldIcon = ({ className }: { className?: string }) => (
 
 export const MonitorUpIcon = ({ className }: { className?: string }) => (
     <IconWrapper className={className}><path d="M13.22 19h4.84a2 2 0 0 0 1.94-2.42l-1.57-8A2 2 0 0 0 16.48 7H4.08a2 2 0 0 0-1.96 1.58l-1.57 8A2 2 0 0 0 2.5 19h4.78"/><path d="M12 13v9"/><path d="M8 17l4-4 4 4"/></IconWrapper>
+);
+
+export const CrownIcon = ({ className, onClick }: { className?: string, onClick?: () => void }) => (
+    <IconWrapper className={className} onClick={onClick}><path d="m2 4 3 12h14l3-12-6 7-4-7-4 7-6-7zm3 16h14"/></IconWrapper>
 );

@@ -6,7 +6,7 @@ import {
   MicIcon, MicOffIcon, VideoIcon, VideoOffIcon, 
   ScreenShareIcon, UsersIcon, MessageSquareIcon, 
   PhoneOffIcon, SparklesIcon, LinkIcon, TrashIcon,
-  ShieldIcon, MonitorUpIcon
+  ShieldIcon, MonitorUpIcon, CrownIcon
 } from './components/Icons';
 import { LiveClient } from './services/liveClient';
 
@@ -37,17 +37,40 @@ export default function App() {
   
   useEffect(() => {
     // Parse meeting ID from URL or generate new
-    const params = new URLSearchParams(window.location.search);
-    const mid = params.get('meetingId') || Math.random().toString(36).substring(7);
-    setMeetingId(mid);
+    let mid = '';
+    try {
+      const url = new URL(window.location.href);
+      const existingMid = url.searchParams.get('meetingId');
+      mid = existingMid || Math.random().toString(36).substring(7);
+      setMeetingId(mid);
+
+      // Automatically update URL bar if ID was generated
+      if (!existingMid) {
+        try {
+          const newUrl = new URL(window.location.href);
+          newUrl.searchParams.set('meetingId', mid);
+          window.history.replaceState({}, '', newUrl.toString());
+        } catch (historyErr) {
+          console.warn("Could not update URL history (SecurityError):", historyErr);
+        }
+      }
+    } catch (e) {
+      console.error("URL Parsing failed:", e);
+      mid = Math.random().toString(36).substring(7);
+      setMeetingId(mid);
+    }
 
     // Initialize Live Client
-    liveClient.current = new LiveClient();
-    liveClient.current.onSpeakingStateChange = (speaking) => {
-      setParticipants(prev => prev.map(p => 
-        p.id === 'gemini-ai' ? { ...p, isSpeaking: speaking } : p
-      ));
-    };
+    try {
+      liveClient.current = new LiveClient();
+      liveClient.current.onSpeakingStateChange = (speaking) => {
+        setParticipants(prev => prev.map(p => 
+          p.id === 'gemini-ai' ? { ...p, isSpeaking: speaking } : p
+        ));
+      };
+    } catch (e) {
+      console.error("Failed to initialize LiveClient:", e);
+    }
 
     return () => {
       if (liveClient.current) liveClient.current.disconnect();
@@ -86,6 +109,8 @@ export default function App() {
     } catch (err) {
       alert("Для работы конференции требуется доступ к камере и микрофону.");
       console.error(err);
+      // Fallback for demo if permissions denied
+      setStep('meeting');
     }
   };
 
@@ -103,26 +128,32 @@ export default function App() {
   const toggleMute = () => {
     if (localStream) {
       localStream.getAudioTracks().forEach(track => track.enabled = !isMuted);
-      setIsMuted(!isMuted);
-      setParticipants(prev => prev.map(p => p.id === 'local' ? {...p, isMuted: !isMuted} : p));
     }
+    setIsMuted(!isMuted);
+    setParticipants(prev => prev.map(p => p.id === 'local' ? {...p, isMuted: !isMuted} : p));
   };
 
   const toggleVideo = () => {
     if (localStream) {
       localStream.getVideoTracks().forEach(track => track.enabled = !isVideoOff);
-      setIsVideoOff(!isVideoOff);
-      setParticipants(prev => prev.map(p => p.id === 'local' ? {...p, isVideoOff: !isVideoOff} : p));
     }
+    setIsVideoOff(!isVideoOff);
+    setParticipants(prev => prev.map(p => p.id === 'local' ? {...p, isVideoOff: !isVideoOff} : p));
   };
 
   const toggleScreenShare = async () => {
-    // If local user is currently sharing, stop it
-    if (activeScreenId === 'local') {
+    // Check if local user is currently sharing
+    const isSharing = !!screenStream;
+
+    if (isSharing) {
       screenStream?.getTracks().forEach(t => t.stop());
       setScreenStream(null);
-      setActiveScreenId(null);
-      setViewMode(ViewMode.GALLERY);
+      
+      // If I was viewing my own screen, reset view
+      if (activeScreenId === 'local') {
+        setActiveScreenId(null);
+        setViewMode(ViewMode.GALLERY);
+      }
       
       setParticipants(prev => prev.map(p => p.id === 'local' ? {...p, isScreenSharing: false} : p));
       return;
@@ -139,10 +170,8 @@ export default function App() {
       // Handle user stopping sharing via browser UI
       stream.getVideoTracks()[0].onended = () => {
         setScreenStream(null);
-        if (activeScreenId === 'local') {
-           setActiveScreenId(null);
-           setViewMode(ViewMode.GALLERY);
-        }
+        // Safely reset state using functional updates
+        setActiveScreenId(prev => prev === 'local' ? null : prev);
         setParticipants(prev => prev.map(p => p.id === 'local' ? {...p, isScreenSharing: false} : p));
       };
     } catch (err) {
@@ -154,15 +183,32 @@ export default function App() {
     const aiPart = participants.find(p => p.role === 'ai');
     if (aiPart?.isSpeaking) {
        liveClient.current?.disconnect();
+       // Force stop visual state
+       setParticipants(prev => prev.map(p => p.role === 'ai' ? {...p, isSpeaking: false} : p));
     } else {
        await liveClient.current?.connect();
     }
   };
 
   const handleShareInvite = () => {
-    const url = `${window.location.origin}?meetingId=${meetingId}`;
-    navigator.clipboard.writeText(url);
-    alert(`Ссылка скопирована: ${url}`);
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set('meetingId', meetingId);
+      const inviteUrl = url.toString();
+      
+      // Try clipboard API first
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(inviteUrl)
+          .then(() => alert(`Ссылка скопирована в буфер обмена:\n${inviteUrl}`))
+          .catch(() => prompt("Скопируйте ссылку вручную:", inviteUrl));
+      } else {
+        // Fallback
+        prompt("Скопируйте ссылку вручную:", inviteUrl);
+      }
+    } catch (e) {
+      console.error("Error generating invite link:", e);
+      alert("Ошибка при создании ссылки: " + meetingId);
+    }
   };
 
   // --- Host Controls ---
@@ -185,6 +231,16 @@ export default function App() {
     }
   };
 
+  const toggleParticipantRole = (id: string) => {
+    setParticipants(prev => prev.map(p => {
+      if (p.id === id) {
+         const newRole = p.role === 'host' ? 'guest' : 'host';
+         return { ...p, role: newRole };
+      }
+      return p;
+    }));
+  };
+
   const focusScreen = (participantId: string) => {
      setActiveScreenId(participantId);
      setViewMode(ViewMode.SCREEN_SHARE);
@@ -201,7 +257,7 @@ export default function App() {
              </div>
           </div>
           <h1 className="text-2xl font-bold text-center mb-2">Присоединиться к встрече</h1>
-          <p className="text-center text-gray-400 mb-6">ID: {meetingId}</p>
+          <p className="text-center text-gray-400 mb-6 font-mono bg-gray-900/50 py-1 rounded">ID: {meetingId}</p>
           
           <div className="space-y-4">
             <div>
@@ -220,6 +276,9 @@ export default function App() {
             >
               Продолжить
             </button>
+            <p className="text-xs text-center text-gray-500 mt-4">
+                Примечание: Это демо-версия. Ссылка сохраняет ID встречи, но участники симулируются.
+            </p>
           </div>
        </div>
     </div>
@@ -239,9 +298,9 @@ export default function App() {
 
         <div className="flex justify-center gap-6 mt-12">
            <div className="p-6 rounded-2xl bg-gray-800/50 border border-gray-700 backdrop-blur-sm w-64">
-              <UsersIcon className="w-10 h-10 text-blue-400 mx-auto mb-4" />
+              <ShieldIcon className="w-10 h-10 text-blue-400 mx-auto mb-4" />
               <h3 className="text-lg font-semibold">Панель Организатора</h3>
-              <p className="text-sm text-gray-400 mt-2">Полный контроль над участниками.</p>
+              <p className="text-sm text-gray-400 mt-2">Управление участниками и правами.</p>
            </div>
            <div className="p-6 rounded-2xl bg-gray-800/50 border border-gray-700 backdrop-blur-sm w-64">
               <MonitorUpIcon className="w-10 h-10 text-purple-400 mx-auto mb-4" />
@@ -375,7 +434,11 @@ export default function App() {
     );
   };
 
-  const renderSidebar = () => (
+  const renderSidebar = () => {
+     const localParticipant = participants.find(p => p.id === 'local');
+     const isLocalHost = localParticipant?.role === 'host';
+
+     return (
      <div className="w-80 bg-gray-800 border-l border-gray-700 flex flex-col shadow-2xl z-20 animate-in slide-in-from-right h-full absolute right-0 top-0">
        <div className="p-4 border-b border-gray-700 flex justify-between items-center bg-gray-800">
           <h2 className="font-bold">{showSidebar === 'chat' ? 'Чат встречи' : `Участники (${participants.length})`}</h2>
@@ -386,6 +449,7 @@ export default function App() {
           {showSidebar === 'participants' ? (
             <div className="p-4 space-y-4">
                {/* Host Controls */}
+               {isLocalHost && (
                <div className="bg-gray-900/50 p-3 rounded-lg border border-gray-700 mb-4">
                   <div className="flex items-center gap-2 mb-3 text-gray-300 text-xs font-semibold uppercase tracking-wider">
                      <ShieldIcon className="w-4 h-4 text-blue-500" />
@@ -408,6 +472,7 @@ export default function App() {
                      </button>
                   </div>
                </div>
+               )}
 
                <div className="space-y-2">
                  {participants.map(p => (
@@ -421,9 +486,9 @@ export default function App() {
                             <img src={p.avatarUrl} className="w-8 h-8 rounded-full" alt="" />
                         )}
                         <div className="flex flex-col truncate">
-                            <span className="text-sm truncate font-medium">
+                            <span className="text-sm truncate font-medium flex items-center gap-1">
                                 {p.name} 
-                                {p.role === 'host' && <span className="ml-2 text-[10px] bg-yellow-600/50 text-yellow-200 px-1 rounded">HOST</span>}
+                                {p.role === 'host' && <CrownIcon className="w-3 h-3 text-yellow-400" />}
                             </span>
                             {p.isScreenSharing && <span className="text-[10px] text-green-400 flex items-center gap-1"><MonitorUpIcon className="w-3 h-3"/> Транслирует экран</span>}
                         </div>
@@ -431,8 +496,15 @@ export default function App() {
 
                       {/* Controls */}
                       <div className="flex items-center gap-1">
-                         {p.role !== 'ai' && p.id !== 'local' && (
+                         {p.role !== 'ai' && p.id !== 'local' && isLocalHost && (
                              <>
+                                <button 
+                                    onClick={() => toggleParticipantRole(p.id)}
+                                    className={`p-1.5 rounded hover:bg-gray-600 transition-colors ${p.role === 'host' ? 'text-yellow-400' : 'text-gray-500 hover:text-yellow-200'}`}
+                                    title={p.role === 'host' ? "Снять права организатора" : "Назначить организатором"}
+                                >
+                                    <CrownIcon className="w-4 h-4" />
+                                </button>
                                 <button 
                                     onClick={() => muteParticipant(p.id)}
                                     className={`p-1.5 rounded hover:bg-gray-600 ${p.isMuted ? 'text-red-400' : 'text-gray-400'}`}
@@ -470,7 +542,8 @@ export default function App() {
           </div>
        )}
     </div>
-  );
+    );
+  };
 
   if (step === 'name') return renderJoinScreen();
   if (step === 'lobby') return renderLobby();
@@ -514,7 +587,7 @@ export default function App() {
 
            <button 
              onClick={toggleScreenShare}
-             className={`p-4 rounded-full transition-colors ${activeScreenId === 'local' ? 'bg-green-600 hover:bg-green-700 shadow-[0_0_15px_rgba(22,163,74,0.5)]' : 'bg-gray-700 hover:bg-gray-600'}`}
+             className={`p-4 rounded-full transition-colors ${screenStream ? 'bg-green-600 hover:bg-green-700 shadow-[0_0_15px_rgba(22,163,74,0.5)]' : 'bg-gray-700 hover:bg-gray-600'}`}
              title="Демонстрация экрана"
            >
              <ScreenShareIcon className="w-6 h-6" />
